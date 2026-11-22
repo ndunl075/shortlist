@@ -11,9 +11,10 @@ import sys
 import threading
 import time
 
-from . import codediff, pack, patch as patchmod, verify
+from . import cmpproof, codediff, pack, patch as patchmod, verify
 from .filemap import FileMap
 from .linemap import LineMap
+from .slotmap import SlotMap
 
 DATA = os.environ.get("RWX_DATA", "/data")
 PINNED = os.environ.get("RWX_PINNED", "/opt/sqlglot")
@@ -21,8 +22,8 @@ T0 = time.monotonic()
 
 # --- cost model (board seconds) ---------------------------------------------------------------
 HEAVY_MS = 2500        # a test this slow is never run here
-RUN_START_S = 0.5      # one pytest process: interpreter, pytest, sqlglot, collection
-RUN_FACTOR = 1.0       # CPU charged per recorded second of a test that is run
+RUN_START_S = {"hot": 0.5, "cold": 3.0}   # fixed CPU of one run in a child of the warm servers (board seconds)
+RUN_FACTOR = 1.3       # CPU charged per recorded second of a test that is run
 RUN_LEFTOVER_S = 0.8   # expected cost of what still has to be selected after a run
 RUN_MARGIN_S = 0.0
 COLD_EXTRA_S = 4.0     # a test whose own process costs this much more CPU than an empty test is not run (spawn pools)
@@ -77,6 +78,27 @@ class Ctx:
         self.always |= {n for n in self.all if n not in {m for m in self.lnum_at if m is not None}}
         # a test that starts worker processes pays for every worker's start-up: never run here
         self.runnable -= {self.lnum_at[i] for i in lm.pool if self.lnum_at[i] is not None}
+        # children of a hot run would import the pinned tree: tests that start processes run cold only
+        self.spawn = {self.lnum_at[i] for i in lm.spawn if self.lnum_at[i] is not None} | self.always
+
+        self.sm = None
+        self.state_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", "state.json.gz")
+        try:
+            sm = SlotMap()
+            if sm.ids == lm.ids and sm.complete and os.path.exists(self.state_path):
+                self.sm = sm
+                self.snum_at = self.lnum_at
+            else:
+                log("slot map not usable: import-time edits select every importer")
+        except Exception as e:
+            log("slot map unavailable (%r): import-time edits select every importer" % (e,))
+
+        self.cmp = None
+        try:
+            if os.environ.get("RWX_CMP_PROOF", "1") == "1":
+                self.cmp = cmpproof.CmpMap()
+        except Exception as e:
+            log("no comparison profiles (%r): slow tests are selected whenever they are candidates" % (e,))
 
     def openers(self, path):
         return {self.num_at[i] for i in self.fm.openers(path) if self.num_at[i] is not None} | self.always
@@ -92,6 +114,13 @@ class Plan:
         self.cand = set()
         self.new_files = {}     # path -> patched bytes
         self.unrun = set()      # candidates that a run in a fresh process cannot settle
+        self.diffs = {}         # patched Python file -> codediff.Diff, or None if it does not compile
+        self.base = set()       # candidates that do not depend on what the import-time edits change
+        self.importers = set()  # tests that run the changed import-time code: the fallback for those edits
+        self.slots = False      # import-time edits whose effect the slot comparison can narrow down
+        self.text_readers = set()  # tests that read a patched Python file as data
+        self.fixture = False    # a fixture file changed: its readers are selected, not run
+        self.mode = "cold"
         self.listed = []        # candidates selected without running
         self.run = []           # candidates to run
         self.notes = []
@@ -117,9 +146,12 @@ def is_python(path):
 def classify(c, p, path, old, new):
     """Add the candidates of one changed file to the plan, or return the reason why every test is selected."""
     if path.startswith("tests/fixtures/"):
-        p.cand |= c.openers(path)
+        got = c.openers(path)
         if c.lm is not None:
-            p.cand |= c.nums(c.lm.readers(path))
+            got |= c.nums(c.lm.readers(path))
+        p.cand |= got
+        # an edited fixture nearly always fails the tests that read it: running them first only adds CPU
+        p.unrun |= got
         return None
     if not is_python(path):
         return "unclassified file %s" % path
@@ -129,16 +161,29 @@ def classify(c, p, path, old, new):
         p.cand |= c.openers(path)
         return None
     # whoever reads the source as data sees any change of its text
-    p.cand |= c.nums(c.lm.readers(path)) | c.always
+    p.text_readers |= c.nums(c.lm.readers(path)) | c.always
+    p.cand |= p.text_readers
     try:
-        lines = codediff.changed_lines(old, new, path, codediff.pinned_code(PINNED, path, old))
+        d = codediff.diff(old, new, path, codediff.pinned_code(PINNED, path, old))
     except codediff.Broken as e:
         # the module no longer compiles: every process that imports it is affected
         p.notes.append("%s does not compile (%s)" % (path, e))
         p.cand |= c.openers(path)
+        p.diffs[path] = None
         return None
+    p.diffs[path] = d
+    lines = d.lines
+    if d.import_level and c.sm is not None and path.startswith("sqlglot/"):
+        # Import-time code changed.  Whoever runs changed function code is a candidate as always; the
+        # effect of the import-time part is the set of slots it changes, known after a comparison of
+        # the two import states: until then (and if that fails) every test that runs the changed
+        # import-time lines, i.e. every importer, stands in.
+        imp, _ = c.lm.executors(path, lines - d.func_lines)
+        p.importers |= c.nums(imp)
+        p.slots = True
+        lines = d.func_lines
     cold, sess = c.lm.executors(path, lines)
-    p.notes.append("%s: lines %s" % (path, sorted(lines)[:8]))
+    p.notes.append("%s: lines %s%s" % (path, sorted(d.lines)[:8], " (import-time)" if d.import_level else ""))
     p.cand |= c.nums(cold) | c.nums(sess)
     # reached only after earlier tests of the whole suite: a run of the candidates alone proves nothing
     p.unrun |= c.nums(sess)
@@ -181,16 +226,162 @@ def plan_patch(c, pid, data):
             p.everything = why
             return p
         p.new_files[path] = new
+    p.base = set(p.cand)
+    p.cand |= p.importers
     return p
+
+
+_LIBS = {}
+
+
+def imports_libs(test_file, depth=0):
+    """True if collecting `test_file` imports numpy, pandas or duckdb (directly or through a test module)."""
+    import re
+
+    if test_file not in _LIBS:
+        _LIBS[test_file] = False
+        try:
+            with open(os.path.join(PINNED, test_file), "rb") as f:
+                src = f.read().decode("utf-8", "replace")
+        except OSError:
+            src = "import numpy"
+        if re.search(r"^\s*(?:import|from)\s+(?:numpy|pandas|duckdb)\b", src, re.M):
+            _LIBS[test_file] = True
+        elif depth < 4:
+            for m in re.finditer(r"^\s*(?:from|import)\s+(tests(?:\.\w+)*)", src, re.M):
+                mod = m.group(1).replace(".", "/")
+                for cand in (mod + ".py", mod + "/__init__.py"):
+                    if os.path.isfile(os.path.join(PINNED, cand)) and imports_libs(cand, depth + 1):
+                        _LIBS[test_file] = True
+    return _LIBS[test_file]
+
+
+def function_readers(c, where):
+    """Tests that run the code of a function-like slot ("file:first-last" of the pinned code)."""
+    path, _, span = where.rpartition(":")
+    lo, _, hi = span.partition("-")
+    cold, sess = c.lm.executors(path, range(int(lo), int(hi) + 1))
+    return c.nums(cold) | c.nums(sess)
+
+
+def global_readers(c, modname, name):
+    """Tests that run a line of the module's own functions that mentions the global `name`."""
+    import ast
+
+    for path in (modname.replace(".", "/") + ".py", modname.replace(".", "/") + "/__init__.py"):
+        full = os.path.join(PINNED, path)
+        if os.path.isfile(full):
+            break
+    else:
+        return None
+    with open(full, "rb") as f:
+        tree = ast.parse(f.read())
+    lines = set()
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for node in ast.walk(fn):
+                if isinstance(node, ast.Name) and node.id == name:
+                    lines.update(range(node.lineno, node.end_lineno + 1))
+                elif isinstance(node, (ast.Global, ast.Nonlocal)) and name in node.names:
+                    lines.update(range(fn.lineno, fn.end_lineno + 1))
+    cold, sess = c.lm.executors(path, lines)
+    return c.nums(cold) | c.nums(sess)
+
+
+MAX_CHANGED_SLOTS = 400
+
+
+def slot_readers(c, changed):
+    """Tests that can see any of the changed slots, or (None, reason) when that cannot be told."""
+    if len(changed) > MAX_CHANGED_SLOTS:
+        return None, "%d slots changed" % len(changed)
+    out = set()
+    for key, (a, b) in changed.items():
+        if key[0] == "E" or a is None or b is None or key.endswith("<structure>"):
+            return None, "%s %s" % (key.replace("\t", " "), "appears or disappears" if key[0] != "E" else "fails to import")
+        ka, kb = a[0], b[0]
+        if ka != kb or ka == "x":
+            return None, "%s holds another kind of value" % key.replace("\t", " ")
+        parts = key.split("\t")
+        if ka == "f":
+            if "@" not in a:
+                return None, "%s: code of unknown place" % key.replace("\t", " ")
+            got = function_readers(c, a.split("@", 1)[1])
+        elif parts[0] == "C":
+            got = c.sm.class_readers(key)
+            if got is None:
+                return None, "%s is not traced" % key.replace("\t", " ")
+            got = {c.snum_at[i] for i in got if c.snum_at[i] is not None}
+        else:
+            inner = global_readers(c, parts[1], parts[2])
+            if inner is None:
+                return None, "%s: no source" % key.replace("\t", " ")
+            got = inner | {c.snum_at[i] for i in c.sm.module_readers(key) if c.snum_at[i] is not None}
+        out |= got
+    return out, "%d slots" % len(changed)
+
+
+def resolve_slots(c, p, servers, slot, budget):
+    """Replace "every importer" by the readers of the slots that the import-time edits change."""
+    memo = {}
+    translate = {}
+    for d in p.diffs.values():
+        if d is not None:
+            for old, new in d.pairs:
+                translate[codediff.code_hash(new, memo)] = codediff.code_hash(old, memo)
+    changed = verify.changed_slots(servers, slot, p.new_files, translate, c.state_path, budget)
+    readers, note = slot_readers(c, changed)
+    if readers is None:
+        p.notes.append("slots: %s -> every importer" % note)
+        return
+    p.notes.append("slots: %s, %d readers instead of %d importers" % (note, len(readers), len(p.importers)))
+    p.cand = p.base | readers | c.always
 
 
 def items(c, nums):
     return [(n, c.ms[n]) for n in nums]
 
 
-def decide(c, p):
+def hot_ok(c, p, loaded):
+    """True if the hot server can hold this patch exactly (see selector/zygote.py)."""
+    if loaded is None or c.lm is None or not p.new_files:
+        return False
+    for path in p.new_files:
+        if not (path.startswith("sqlglot/") and path.endswith(".py")) or path not in p.diffs:
+            return False
+        if path not in loaded:
+            continue   # imported later, from the patched source
+        d = p.diffs[path]
+        if d is None or d.import_level or c.lm.ran_at_collection(path, d.lines):
+            return False
+    return True
+
+
+def prove_slow(c, p):
+    """Drop slow tests that provably run as before (selector/cmpproof.py)."""
+    if c.cmp is None or len(p.new_files) != 1:
+        return
+    (path, new), = p.new_files.items()
+    if p.diffs.get(path) is None:
+        return
+    slow = [n for n in p.cand if c.id_of[n] in c.cmp.tests and n not in p.text_readers and n not in p.unrun]
+    if not slow:
+        return
+    swap = cmpproof.single_compare_swap(read_pinned(path), new, path)
+    if swap is None:
+        return
+    for n in slow:
+        if c.cmp.same_outcome(c.id_of[n], *swap):
+            p.cand.discard(n)
+            p.base.discard(n)
+            p.notes.append("%s runs as before (%s -> %s at %s)" % (c.id_of[n].rsplit("::", 1)[1], swap[1], swap[2], swap[0]))
+
+
+def decide(c, p, loaded):
     """Split the candidates into `listed` (selected unrun) and `run`."""
+    prove_slow(c, p)
     cand = sorted(p.cand)
+    p.mode = "hot" if hot_ok(c, p, loaded) else "cold"
     unrun = [n for n in cand if n not in c.runnable or n in p.unrun]
     rest = [n for n in cand if n in c.runnable and n not in p.unrun]
     # workers that the unrun candidates pay for anyway take other candidates for free
@@ -200,11 +391,14 @@ def decide(c, p):
     free = {n for b in bins for n, _ in b} - before
     rest = [n for n in rest if n not in free]
     listed = unrun + sorted(free)
+    if p.mode == "hot" and any(n in c.spawn for n in rest):
+        p.mode = "cold"
     if rest:
         list_cost = pack.cost_of(items(c, cand)) / 1000.0
-        run_cost = (RUN_START_S + RUN_FACTOR * sum(c.ms[n] for n in rest) / 1000.0
+        run_cost = (RUN_START_S[p.mode] + RUN_FACTOR * sum(c.ms[n] for n in rest) / 1000.0
                     + (EXECUTOR_SETUP_S if any(c.file_of[n] == "tests/test_executor.py" for n in rest) else 0.0)
-                    + pack.cost_of(items(c, listed)) / 1000.0 + RUN_LEFTOVER_S)
+                    + pack.cost_of(items(c, listed)) / 1000.0 + (RUN_LEFTOVER_S if not listed else 0.0))
+        p.notes.append("list %.1f run %.1f (%s)" % (list_cost, run_cost, p.mode))
         if run_cost + RUN_MARGIN_S < list_cost:
             p.listed, p.run = listed, rest
             return
@@ -255,14 +449,13 @@ def main():
     stop_at = T0 + limit - 70.0   # no verification starts after this
     kill_at = T0 + limit - 45.0   # running verifications are killed at this point
     plans = []
-    stats = {"everything": 0, "empty": 0, "listed": 0, "run": 0, "run_clean": 0, "errors": 0}
+    todo = []
+    stats = {"everything": 0, "empty": 0, "listed": 0, "run": 0, "hot": 0, "run_clean": 0, "errors": 0}
     for pid in pids:
         try:
             with open(os.path.join(DATA, "commits", pid + ".patch"), "rb") as f:
                 data = f.read()
             p = plan_patch(c, pid, data)
-            if p.everything is None:
-                decide(c, p)
         except Exception as e:
             log("%s: error while planning (%r)" % (pid, e))
             stats["errors"] += 1
@@ -272,12 +465,48 @@ def main():
             log("%s: every test: %s" % (pid, p.everything))
             stats["everything"] += 1
             out.emit(pid, c.all_bins)
-        elif not p.run:
-            stats["listed" if p.cand else "empty"] += 1
-            log("%s: %d candidates, selected unrun %s" % (pid, len(p.cand), "; ".join(p.notes)))
-            out.emit(pid, answer(c, p, p.listed))
+        elif not p.cand:
+            stats["empty"] += 1
+            log("%s: no candidates %s" % (pid, "; ".join(p.notes)))
+            out.emit(pid, [])
+        else:
+            todo.append(p)
+    # which modules a collected suite has imported: taken from the whole-suite collection of the pinned
+    # commit (a superset of what the hot server, which collects fewer files, will have imported)
+    loaded = c.lm.loaded if c.lm is not None and c.lm.loaded else None
+    for p in todo:
+        if p.slots:
+            plans.append(p)   # its candidates are settled by a comparison of import states first
+            continue
+        try:
+            decide(c, p, loaded)
+        except Exception as e:
+            log("%s: error while deciding (%r)" % (p.pid, e))
+            p.listed, p.run = sorted(p.cand), []
+        if not p.run:
+            stats["listed"] += 1
+            log("%s: %d candidates, selected unrun %s" % (p.pid, len(p.cand), "; ".join(p.notes)))
+            out.emit(p.pid, answer(c, p, p.cand))
         else:
             plans.append(p)
+    servers = None
+    if plans:
+        hot_files, may_run = [], set()
+        for p in plans:
+            may_run |= {c.file_of[n] for n in (p.cand if p.slots else p.run)}
+            if not p.slots and p.mode == "hot":
+                for n in p.run:
+                    if c.file_of[n] not in hot_files:
+                        hot_files.append(c.file_of[n])
+        hot_files.sort(key=lambda f: min(n for n in c.all if c.file_of[n] == f))
+        try:
+            servers = verify.Servers(log, libs=any(imports_libs(f) for f in may_run), hot_files=hot_files)
+        except Exception as e:
+            log("no warm servers (%r): nothing is run" % (e,))
+            for p in plans:
+                out.emit(p.pid, answer(c, p, p.cand))
+            plans = []
+    log("planned %d patches in %.1fs, %d to run" % (len(pids), time.monotonic() - T0, len(plans)))
 
     def fallback(p):
         out.emit(p.pid, answer(c, p, p.cand))
@@ -308,9 +537,35 @@ def main():
                     log("%s: out of time, %d candidates selected unrun" % (p.pid, len(p.cand)))
                     fallback(p)
                     continue
+                if p.slots:
+                    if not servers.wait("cold", slot, 60.0):
+                        raise RuntimeError("no server")
+                    try:
+                        resolve_slots(c, p, servers, slot, min(40.0, kill_at - time.monotonic()))
+                    except Exception as e:
+                        p.notes.append("slots: %r -> every importer" % (e,))
+                    decide(c, p, None)   # no hot run: the hot server was started without this patch's test files
+                    if not p.run:
+                        stats["listed" if p.cand else "empty"] += 1
+                        log("%s: %d candidates, selected unrun %s" % (p.pid, len(p.cand), "; ".join(p.notes)))
+                        out.emit(p.pid, answer(c, p, p.cand))
+                        continue
                 ids = [c.id_of[n] for n in p.run]
+                recorded = {i: c.ms[c.num_of[i]] / 1000.0 for i in ids}
                 budget = min(kill_at - time.monotonic(), 30.0 + 6.0 * sum(c.ms[n] for n in p.run) / 1000.0)
-                res = verify.run(slot, p.new_files, ids, {i: c.ms[c.num_of[i]] / 1000.0 for i in ids}, budget, log)
+                mode = p.mode if servers.wait(p.mode, slot, 60.0) else "cold"
+                if not servers.wait(mode, slot, 60.0):
+                    raise RuntimeError("no server")
+                changes = [{"path": path, "swaps": d.swaps if d is not None else None} for path, d in p.diffs.items()]
+                res = verify.run(servers, slot, mode, p.new_files, changes, ids, recorded, budget)
+                if res.hot_refused:
+                    log("%s: hot server refused (%s), running cold" % (p.pid, res.note))
+                    if not servers.wait("cold", slot, 60.0):
+                        raise RuntimeError("no server")
+                    res = verify.run(servers, slot, "cold", p.new_files, changes, ids, recorded,
+                                     min(budget, kill_at - time.monotonic()))
+                elif mode == "hot":
+                    stats["hot"] += 1
                 keep = set(p.listed) | {c.num_of[i] for i in res.unverified}
                 if res.teardown_failed:
                     # a failing class or module teardown is charged to the last test of its scope
@@ -335,6 +590,8 @@ def main():
         t.start()
     for t in threads:
         t.join()
+    if servers is not None:
+        servers.close()
     verify.cleanup()
     log("stats %s wall %.1fs cpu %s" % (json.dumps(stats), time.monotonic() - T0, container_cpu()))
     return 0

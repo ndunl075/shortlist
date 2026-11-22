@@ -12,6 +12,15 @@ import os
 PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "maps", "lines.json.gz")
 
 
+def decode(text):
+    out = []
+    if text:
+        for part in text.split(","):
+            a, _, b = part.partition("-")
+            out.extend(range(int(a), int(b) + 1) if b else (int(a),))
+    return out
+
+
 class LineMap:
     def __init__(self, path=PATH):
         with gzip.open(path, "rt") as f:
@@ -23,6 +32,16 @@ class LineMap:
         self.cpu = d["cpu"]
         self.unknown = set(d["unknown"])
         self.pool = set(d["pool"])   # tests that start worker processes
+        self.spawn = set(d.get("spawn", range(len(self.ids))))  # tests whose child processes may run checkout code
+        self.loaded = set(d.get("loaded", ()))  # files of the modules a whole-suite collection imports
+        self.collect = d.get("collect")  # file -> [[first, last], ...]: lines run while the suite is collected
+
+    def ran_at_collection(self, path, lines):
+        """True if any of `lines` ran while the whole suite was imported and collected (or if unknown)."""
+        if self.collect is None:
+            return True
+        rows = self.collect.get(path, ())
+        return any(lo <= ln <= hi for ln in lines for lo, hi in rows)
 
     def executors(self, path, lines):
         """(cold, session-only): indexes of the tests that execute any of `lines` of `path`."""
@@ -36,11 +55,11 @@ class LineMap:
             if k == len(want):
                 break
             if want[k] <= hi:
-                cold.update(self._sets[cs])
+                cold.update(decode(self._sets[cs]))
                 if es >= 0:
-                    sess.update(self._sets[es])
+                    sess.update(decode(self._sets[es]))
         return cold, sess - cold
 
     def readers(self, path):
         s = self.reads.get(path)
-        return (set(self._sets[s]) if s is not None else set()) | self.unknown
+        return (set(decode(self._sets[s])) if s is not None else set()) | self.unknown

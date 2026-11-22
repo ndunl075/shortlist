@@ -140,8 +140,28 @@ def _handlers(code, index_of):
     return out
 
 
-def _diff(o, n, lines):
-    """Add to `lines` the old lines of `o` (and of nested code) that hold marked instructions."""
+class Diff:
+    def __init__(self):
+        self.lines = set()        # old lines holding marked instructions
+        self.func_lines = set()   # those of them that sit in function code
+        self.pairs = []           # (old code, new code) of function code that changed or holds changed code
+        self.import_level = False  # a marked instruction sits in module or class-body code
+        self.swaps = []           # (old qualname, old first line, new qualname, new first line) of the
+                                  # function code that changed or holds changed code, outermost first
+
+
+def _diff(o, n, d):
+    """Mark `o` against `n`; returns True if anything in the subtree differs."""
+    at = len(d.swaps)
+    differs = _diff1(o, n, d)
+    if differs and o.co_flags & 0x01:
+        d.swaps.insert(at, (o.co_qualname, o.co_firstlineno, n.co_qualname, n.co_firstlineno))
+        d.pairs.append((o, n))
+    return differs
+
+
+def _diff1(o, n, d):
+    lines = d.lines
     if _same_body(o, n):
         for a, b in zip(o.co_consts, n.co_consts):
             if isinstance(a, types.CodeType):
@@ -149,10 +169,11 @@ def _diff(o, n, lines):
                     # cannot tell which instruction creates it without disassembling: do so below
                     break
         else:
+            differs = False
             for a, b in zip(o.co_consts, n.co_consts):
                 if isinstance(a, types.CodeType):
-                    _diff(a, b, lines)
-            return
+                    differs = _diff(a, b, d) or differs
+            return differs
     old = list(dis.get_instructions(o))
     new = list(dis.get_instructions(n))
     oi = {ins.offset: i for i, ins in enumerate(old)}
@@ -188,7 +209,9 @@ def _diff(o, n, lines):
                 marked.add(i)
                 all_lines(a.argval, lines)
             else:
-                _diff(a.argval, b.argval, lines)
+                _diff(a.argval, b.argval, d)
+    if marked and not o.co_flags & 0x01:
+        d.import_level = True
     # Entering a function runs its prologue, which reports no line of its own: a marked prologue
     # instruction (or a new stretch right at the entry) stands for "any execution of this code".
     is_func = bool(o.co_flags & 0x01)
@@ -197,6 +220,7 @@ def _diff(o, n, lines):
         ins = old[i]
         return is_func and (ins.opname in _PROLOGUE or (ins.opname == "POP_TOP" and i > 0 and old[i - 1].opname == "RETURN_GENERATOR"))
 
+    own = set()
     whole = -1 in marked
     for i in marked:
         if i < 0:
@@ -205,13 +229,45 @@ def _diff(o, n, lines):
         if ins.line_number is None or prologue(i):
             whole = True
         else:
-            lines.add(ins.line_number)
+            own.add(ins.line_number)
         if isinstance(ins.argval, types.CodeType):
-            all_lines(ins.argval, lines)
+            all_lines(ins.argval, own)
     if whole:
         for i, ins in enumerate(old):
             if ins.line_number is not None and not prologue(i):
-                lines.add(ins.line_number)
+                own.add(ins.line_number)
+    lines |= own
+    if is_func:
+        d.func_lines |= own
+    return True
+
+
+def code_hash(code, memo=None):
+    """A digest of what a code object does: instructions, names and constants, nested code included,
+    but no line numbers and no file name."""
+    import hashlib
+
+    if memo is None:
+        memo = {}
+    got = memo.get(id(code))
+    if got is None:
+        h = hashlib.blake2b(digest_size=10)
+        for part in (code.co_code, code.co_exceptiontable,
+                     repr((code.co_names, code.co_varnames, code.co_freevars, code.co_cellvars, code.co_flags,
+                           code.co_argcount, code.co_posonlyargcount, code.co_kwonlyargcount, code.co_qualname)).encode()):
+            h.update(part)
+            h.update(b"|")
+        own_line = "__firstlineno__" in code.co_names
+        for c in code.co_consts:
+            if isinstance(c, types.CodeType):
+                h.update(code_hash(c, memo).encode())
+            elif own_line and type(c) is int and c == code.co_firstlineno:
+                h.update(b"<line>")
+            else:
+                h.update(repr(_const_key(c)).encode("utf-8", "backslashreplace"))
+            h.update(b"|")
+        got = memo[id(code)] = h.hexdigest()
+    return got
 
 
 def pinned_code(pinned_root, path, source):
@@ -239,13 +295,19 @@ def pinned_code(pinned_root, path, source):
     return compile_source(source, path)
 
 
-def changed_lines(old_source, new_source, path, old_code=None):
-    """Old line numbers a test must execute to be affected.  Raises Broken if the new source does not compile."""
+def diff(old_source, new_source, path, old_code=None):
+    """Compare the pinned module with the patched one.  Raises Broken if the new source does not compile."""
     new = compile_source(new_source, path)
     old = old_code if old_code is not None else compile_source(old_source, path)
-    lines = set()
+    d = Diff()
     if _props(old) != _props(new):
-        all_lines(old, lines)
-        return lines
-    _diff(old, new, lines)
-    return lines
+        all_lines(old, d.lines)
+        d.import_level = True
+        return d
+    _diff(old, new, d)
+    return d
+
+
+def changed_lines(old_source, new_source, path, old_code=None):
+    """Old line numbers a test must execute to be affected."""
+    return diff(old_source, new_source, path, old_code).lines
